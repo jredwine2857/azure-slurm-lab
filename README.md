@@ -62,9 +62,15 @@ meaningfully more — treat that as a deliberate next step, not a default.
    org/username and repo name), then run it. It creates the resource group,
    an Entra app registration + service principal, two OIDC federated
    credentials (one for the environment-gated deploy job, one for the
-   branch-triggered smoke-test/destroy jobs), and a Contributor role
-   assignment scoped **only** to `rg-slurm-lab` — this identity can't touch
-   anything else in your subscription.
+   branch-triggered smoke-test/destroy jobs), and a **subscription-scoped**
+   Contributor role assignment. It's subscription-scoped rather than
+   `rg-slurm-lab`-scoped deliberately: a resource-group-scoped role
+   assignment is a child of that group and gets deleted along with it on
+   every `az group delete` in `destroy.yml`, which breaks the *next* deploy
+   (login succeeds but the identity has no role anywhere). The workflows
+   themselves only ever touch `rg-slurm-lab`, but the identity technically
+   could reach other resource groups in the subscription — worth knowing if
+   you reuse this app registration for anything else.
 5. Set the three secrets it prints out: `gh secret set AZURE_CLIENT_ID`,
    `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`
 6. In the repo's Settings → Environments, create an environment named

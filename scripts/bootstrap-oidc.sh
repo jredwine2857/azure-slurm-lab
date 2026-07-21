@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # One-time setup: creates the resource group, Entra app registration + service
-# principal, OIDC federated credentials, and a Contributor role assignment
-# scoped ONLY to rg-slurm-lab (least privilege — this identity can never touch
-# anything else in the subscription). Run this once locally after `az login`
-# and `gh auth login`. Safe to re-run — each step checks for an existing
-# resource before creating one, instead of guessing from a failed create.
+# principal, OIDC federated credentials, and a subscription-scoped Contributor
+# role assignment for that app (see the comment near the role assignment below
+# for why it's subscription-scoped rather than scoped to rg-slurm-lab). Run
+# this once locally after `az login` and `gh auth login`. Safe to re-run —
+# each step checks for an existing resource before creating one, instead of
+# guessing from a failed create.
 set -euo pipefail
 
 # --- Fill these in before running ---
@@ -81,8 +82,15 @@ create_federated_credential \
   "${SUBJECT_PREFIX}:ref:refs/heads/main" \
   "smoke-test/destroy/auto-destroy-stale jobs, not environment-gated"
 
-echo "Assigning Contributor on $RG_NAME only (not the subscription)..."
-SCOPE="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RG_NAME}"
+echo "Assigning Contributor at the subscription scope..."
+# Deliberately subscription-scoped, not rg-slurm-lab-scoped: role assignments
+# are children of the resource group they're scoped to, so a resource-group-
+# scoped assignment gets deleted along with the RG on every `az group delete`
+# in destroy.yml, breaking the *next* deploy (az login succeeds but reports
+# "No subscriptions found" since the SP has no role anywhere anymore). The
+# workflows themselves only ever reference rg-slurm-lab, so this is a
+# practical tradeoff, not a hard boundary.
+SCOPE="/subscriptions/${SUBSCRIPTION_ID}"
 existing_assignment=$(MSYS_NO_PATHCONV=1 az role assignment list --assignee "$APP_ID" --scope "$SCOPE" --query "[?roleDefinitionName=='Contributor'].id" -o tsv)
 if [ -n "$existing_assignment" ]; then
   echo "Role assignment already exists, skipping."
