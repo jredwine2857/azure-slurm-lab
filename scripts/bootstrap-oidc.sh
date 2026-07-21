@@ -3,13 +3,9 @@
 # principal, OIDC federated credentials, and a Contributor role assignment
 # scoped ONLY to rg-slurm-lab (least privilege — this identity can never touch
 # anything else in the subscription). Run this once locally after `az login`
-# and `gh auth login`. Safe to re-run — each step no-ops if it already exists.
+# and `gh auth login`. Safe to re-run — each step checks for an existing
+# resource before creating one, instead of guessing from a failed create.
 set -euo pipefail
-
-# Git Bash/MSYS mangles leading-slash args like "/subscriptions/..." into
-# fake Windows paths, which silently breaks `--scope` on role assignment
-# commands. This disables that path conversion for this script.
-export MSYS_NO_PATHCONV=1
 
 # --- Fill these in before running ---
 GITHUB_ORG="jredwine2857"
@@ -26,6 +22,15 @@ read -p "Press enter to continue with this subscription, or Ctrl+C to abort and 
 SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 TENANT_ID=$(az account show --query tenantId -o tsv)
 
+# GitHub's OIDC subject claim includes the numeric owner/repo IDs (not just
+# names) as of their 2025+ immutable-ID format, e.g.
+# "repo:owner@123/repo@456:environment:name". Federated credentials must
+# match that exactly, so fetch the real IDs instead of hardcoding them.
+OWNER_ID=$(gh api "repos/${GITHUB_ORG}/${GITHUB_REPO}" --jq '.owner.id')
+REPO_ID=$(gh api "repos/${GITHUB_ORG}/${GITHUB_REPO}" --jq '.id')
+SUBJECT_PREFIX="repo:${GITHUB_ORG}@${OWNER_ID}/${GITHUB_REPO}@${REPO_ID}"
+echo "OIDC subject prefix resolved to: $SUBJECT_PREFIX"
+
 echo "Creating resource group $RG_NAME in $LOCATION..."
 az group create --name "$RG_NAME" --location "$LOCATION" --output none
 
@@ -41,40 +46,50 @@ fi
 echo "Ensuring service principal exists for the app..."
 az ad sp show --id "$APP_ID" --output none 2>/dev/null || az ad sp create --id "$APP_ID" --output none
 
+create_federated_credential() {
+  local cred_name="$1" subject="$2" description="$3"
+  local existing
+  existing=$(az ad app federated-credential list --id "$APP_ID" --query "[?name=='${cred_name}'].id" -o tsv)
+  if [ -n "$existing" ]; then
+    echo "Federated credential '$cred_name' already exists, skipping."
+    return
+  fi
+  local tmpfile
+  tmpfile=$(mktemp)
+  cat > "$tmpfile" <<EOF
+{
+  "name": "${cred_name}",
+  "issuer": "https://token.actions.githubusercontent.com/",
+  "subject": "${subject}",
+  "description": "${description}",
+  "audiences": ["api://AzureADTokenExchange"]
+}
+EOF
+  az ad app federated-credential create --id "$APP_ID" --parameters "$tmpfile"
+  rm -f "$tmpfile"
+}
+
 echo "Creating federated credential for the environment-gated deploy job..."
-cat > /tmp/fed-env.json <<EOF
-{
-  "name": "slurm-lab-environment-azure-lab",
-  "issuer": "https://token.actions.githubusercontent.com/",
-  "subject": "repo:${GITHUB_ORG}/${GITHUB_REPO}:environment:azure-lab",
-  "description": "Deploy job gated by the azure-lab GitHub Environment",
-  "audiences": ["api://AzureADTokenExchange"]
-}
-EOF
-az ad app federated-credential create --id "$APP_ID" --parameters /tmp/fed-env.json 2>/dev/null \
-  || echo "Federated credential for environment:azure-lab already exists, skipping."
+create_federated_credential \
+  "slurm-lab-environment-azure-lab" \
+  "${SUBJECT_PREFIX}:environment:azure-lab" \
+  "Deploy job gated by the azure-lab GitHub Environment"
 
-echo "Creating federated credential for branch-triggered jobs (verify/destroy)..."
-cat > /tmp/fed-branch.json <<EOF
-{
-  "name": "slurm-lab-branch-main",
-  "issuer": "https://token.actions.githubusercontent.com/",
-  "subject": "repo:${GITHUB_ORG}/${GITHUB_REPO}:ref:refs/heads/main",
-  "description": "smoke-test/destroy/auto-destroy-stale jobs, not environment-gated",
-  "audiences": ["api://AzureADTokenExchange"]
-}
-EOF
-az ad app federated-credential create --id "$APP_ID" --parameters /tmp/fed-branch.json 2>/dev/null \
-  || echo "Federated credential for ref:refs/heads/main already exists, skipping."
-
-rm -f /tmp/fed-env.json /tmp/fed-branch.json
+echo "Creating federated credential for branch-triggered jobs (smoke-test/destroy)..."
+create_federated_credential \
+  "slurm-lab-branch-main" \
+  "${SUBJECT_PREFIX}:ref:refs/heads/main" \
+  "smoke-test/destroy/auto-destroy-stale jobs, not environment-gated"
 
 echo "Assigning Contributor on $RG_NAME only (not the subscription)..."
-az role assignment create \
-  --assignee "$APP_ID" \
-  --role "Contributor" \
-  --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RG_NAME}" \
-  --output none 2>/dev/null || echo "Role assignment already exists, skipping."
+SCOPE="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RG_NAME}"
+existing_assignment=$(MSYS_NO_PATHCONV=1 az role assignment list --assignee "$APP_ID" --scope "$SCOPE" --query "[?roleDefinitionName=='Contributor'].id" -o tsv)
+if [ -n "$existing_assignment" ]; then
+  echo "Role assignment already exists, skipping."
+else
+  MSYS_NO_PATHCONV=1 az role assignment create --assignee "$APP_ID" --role "Contributor" --scope "$SCOPE" --output none
+  echo "Created role assignment."
+fi
 
 echo
 echo "Done. Set these as GitHub repo secrets (gh secret set, or the GitHub UI):"
