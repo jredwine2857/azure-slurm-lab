@@ -6,8 +6,13 @@
 # and `gh auth login`. Safe to re-run — each step no-ops if it already exists.
 set -euo pipefail
 
+# Git Bash/MSYS mangles leading-slash args like "/subscriptions/..." into
+# fake Windows paths, which silently breaks `--scope` on role assignment
+# commands. This disables that path conversion for this script.
+export MSYS_NO_PATHCONV=1
+
 # --- Fill these in before running ---
-GITHUB_ORG="<your-github-username-or-org>"
+GITHUB_ORG="jredwine2857"
 GITHUB_REPO="azure-slurm-lab"
 LOCATION="eastus"
 RG_NAME="rg-slurm-lab"
