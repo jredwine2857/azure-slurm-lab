@@ -11,11 +11,13 @@ packages:
   - python3-pip
 
 write_files:
+  # No owner/permissions here: the munge user doesn't exist until the
+  # `munge` package installs later in boot, and cc_write_files aborts the
+  # whole module (silently dropping slurm.conf/hosts too) if chown fails
+  # on a nonexistent user. Ownership/mode are fixed up in runcmd instead.
   - path: /etc/munge/munge.key
     encoding: b64
     content: __MUNGE_KEY__
-    owner: munge:munge
-    permissions: '0400'
 
   - path: /etc/hosts
     append: true
