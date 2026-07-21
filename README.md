@@ -1,0 +1,102 @@
+# azure-slurm-lab
+
+A learning project: GitHub Actions CI/CD + Bicep IaC that deploys a minimal
+2-node Slurm cluster to Azure, so you can practice submitting jobs (including
+PyTorch jobs) to a real Slurm scheduler without paying for it to sit idle.
+
+## What gets created
+
+- 1 resource group (`rg-slurm-lab`)
+- 1 VNet/subnet (`10.0.0.0/24`), 1 NSG (default rules only — no inbound from
+  the internet, VNet-internal traffic allowed, outbound allowed)
+- 2 VMs, no public IPs: `vm-controller` (10.0.0.4, runs `slurmctld` + `slurmd`)
+  and `vm-compute` (10.0.0.5, runs `slurmd`, has Python + CPU PyTorch installed)
+
+No SSH is exposed. All access from CI (and from your machine, if you want it)
+goes through `az vm run-command invoke`, which executes scripts on the VM via
+the Azure control plane.
+
+## Cost
+
+2x `Standard_B2s` (~$0.0416/hr each in East US) plus trivial disk/network
+cost. A few hours of use is well under a dollar. The real risk isn't the rate,
+it's forgetting to destroy — see the safety nets below.
+
+## Lifecycle
+
+- **`Deploy Slurm Lab`** (manual, gated by the `azure-lab` GitHub Environment —
+  you have to approve the run) deploys the cluster and **leaves it running**.
+  It ends with a smoke test (`sinfo`, then a two-node `srun hostname`) so you
+  know the cluster actually formed before you start using it.
+- **`Destroy Slurm Lab`** (manual) deletes the resource group. Run this when
+  you're done for the day.
+- **`Auto-Destroy Stale Slurm Lab`** runs hourly and destroys the lab
+  automatically if it's been up longer than 4 hours (configurable via the
+  workflow's `ttl_hours` input when run manually). This is the backstop for
+  "I forgot" — don't rely on it as your primary cleanup step.
+
+## Running a PyTorch job
+
+Once `Deploy Slurm Lab` finishes, from your machine (with `az login` and
+rights to `rg-slurm-lab`):
+
+```bash
+az vm run-command invoke \
+  --resource-group rg-slurm-lab \
+  --name vm-controller \
+  --command-id RunShellScript \
+  --scripts "srun --nodes=1 --nodelist=compute python3 -c 'import torch; print(torch.rand(3,3))'"
+```
+
+`Standard_B2s` is CPU-only — fine for toy scripts and learning the Slurm
+submission flow, not real training throughput. Swapping `vmSize` to a GPU
+SKU (e.g. an NC-series) is a one-line param change for later, but costs
+meaningfully more — treat that as a deliberate next step, not a default.
+
+## One-time setup (before the first deploy)
+
+1. Install tools: `winget install Microsoft.AzureCLI`, `winget install GitHub.cli`
+2. `az login`, `gh auth login`
+3. Push this repo to GitHub (`gh repo create` or push to an existing empty repo)
+4. Edit the variables at the top of `scripts/bootstrap-oidc.sh` (your GitHub
+   org/username and repo name), then run it. It creates the resource group,
+   an Entra app registration + service principal, two OIDC federated
+   credentials (one for the environment-gated deploy job, one for the
+   branch-triggered smoke-test/destroy jobs), and a Contributor role
+   assignment scoped **only** to `rg-slurm-lab` — this identity can't touch
+   anything else in your subscription.
+5. Set the three secrets it prints out: `gh secret set AZURE_CLIENT_ID`,
+   `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`
+6. In the repo's Settings → Environments, create an environment named
+   `azure-lab` and add yourself as a required reviewer.
+
+## Local validation before pushing changes
+
+```bash
+az bicep build --file infra/main.bicep
+az deployment group what-if \
+  --resource-group rg-slurm-lab \
+  --template-file infra/main.bicep \
+  --parameters mungeKeyBase64=$(head -c 32 /dev/urandom | base64 -w0) adminPassword='Temp123!Temp123!'
+```
+
+## Manual cleanup fallback
+
+If anything goes sideways and the workflows aren't available:
+
+```bash
+az group delete --name rg-slurm-lab --yes
+```
+
+or delete `rg-slurm-lab` from the Azure Portal.
+
+## Recommended VSCode extensions
+
+- `ms-azuretools.vscode-bicep` — Bicep syntax, validation, IntelliSense
+- GitHub Actions extension — view/trigger workflow runs from the editor
+- GitHub Pull Requests and Issues — review/merge without leaving VSCode
+
+## Out of scope for now
+
+GPU SKUs, SSH/interactive access, multi-job scheduling patterns — natural
+next steps once this base deploy → use → destroy loop is proven reliable.

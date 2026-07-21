@@ -1,0 +1,120 @@
+name: Deploy Slurm Lab
+
+on:
+  workflow_dispatch:
+    inputs:
+      location:
+        description: 'Azure region'
+        required: false
+        default: 'eastus'
+      vmSize:
+        description: 'VM size for both nodes'
+        required: false
+        default: 'Standard_B2s'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RG_NAME: rg-slurm-lab
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: azure-lab
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure resource group exists and tag it with deploy time
+        run: |
+          az group create --name "$RG_NAME" --location "${{ inputs.location }}" --output none
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          az group update --name "$RG_NAME" --tags deployedAt="$NOW" --output none
+          echo "Tagged $RG_NAME with deployedAt=$NOW"
+
+      - name: Generate munge key and admin password
+        run: |
+          MUNGE_KEY=$(head -c 1024 /dev/urandom | base64 -w0)
+          ADMIN_PW=$(openssl rand -base64 24)
+          echo "::add-mask::$MUNGE_KEY"
+          echo "::add-mask::$ADMIN_PW"
+          echo "MUNGE_KEY=$MUNGE_KEY" >> "$GITHUB_ENV"
+          echo "ADMIN_PW=$ADMIN_PW" >> "$GITHUB_ENV"
+
+      - name: Deploy Bicep
+        run: |
+          az deployment group create \
+            --resource-group "$RG_NAME" \
+            --template-file infra/main.bicep \
+            --parameters vmSize="${{ inputs.vmSize }}" \
+                         mungeKeyBase64="$MUNGE_KEY" \
+                         adminUsername="azureuser" \
+                         adminPassword="$ADMIN_PW" \
+            --output none
+
+  smoke-test:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Wait for cluster to report ready, then confirm both nodes can run a job
+        run: |
+          echo "Polling controller via run-command until sinfo shows 2 nodes..."
+          for i in $(seq 1 20); do
+            OUT=$(az vm run-command invoke \
+              --resource-group "$RG_NAME" \
+              --name vm-controller \
+              --command-id RunShellScript \
+              --scripts "sinfo -N -h -o '%N %t'" \
+              --query "value[0].message" -o tsv 2>/dev/null || true)
+            echo "--- attempt $i ---"
+            echo "$OUT"
+            if echo "$OUT" | grep -qE 'controller.*(idle|alloc)' && echo "$OUT" | grep -qE 'compute.*(idle|alloc)'; then
+              echo "Both nodes reporting ready."
+              break
+            fi
+            if [ "$i" -eq 20 ]; then
+              echo "Cluster did not become ready in time." >&2
+              exit 1
+            fi
+            sleep 30
+          done
+
+          echo "Submitting a test job across both nodes..."
+          az vm run-command invoke \
+            --resource-group "$RG_NAME" \
+            --name vm-controller \
+            --command-id RunShellScript \
+            --scripts "srun --nodes=2 hostname" \
+            --query "value[0].message" -o tsv
+
+      - name: Print how to submit a PyTorch job
+        run: |
+          cat <<'EOF'
+
+          Cluster is up and left running (it will NOT auto-destroy).
+          When you're done, run the "Destroy Slurm Lab" workflow, or it will
+          be auto-destroyed by the hourly safety-net workflow after its TTL.
+
+          Example: run a PyTorch job on the compute node from your machine
+          (requires az login with rights to this resource group):
+
+            az vm run-command invoke \
+              --resource-group rg-slurm-lab \
+              --name vm-controller \
+              --command-id RunShellScript \
+              --scripts "srun --nodes=1 --nodelist=compute python3 -c 'import torch; print(torch.rand(3,3))'"
+
+          EOF

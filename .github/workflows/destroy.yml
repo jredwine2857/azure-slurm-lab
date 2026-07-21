@@ -1,0 +1,39 @@
+name: Destroy Slurm Lab
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RG_NAME: rg-slurm-lab
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete resource group (blocking until fully gone)
+        run: |
+          if [ "$(az group exists --name "$RG_NAME")" = "true" ]; then
+            az group delete --name "$RG_NAME" --yes
+            echo "Deleted $RG_NAME."
+          else
+            echo "$RG_NAME does not exist — nothing to destroy."
+          fi
+
+      - name: Confirm deletion
+        run: |
+          EXISTS=$(az group exists --name "$RG_NAME")
+          echo "az group exists --name $RG_NAME -> $EXISTS"
+          if [ "$EXISTS" = "true" ]; then
+            echo "Resource group still exists after delete!" >&2
+            exit 1
+          fi

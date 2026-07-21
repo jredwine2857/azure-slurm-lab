@@ -1,0 +1,57 @@
+name: Auto-Destroy Stale Slurm Lab
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      ttl_hours:
+        description: 'Destroy if the lab has been up longer than this many hours'
+        required: false
+        default: '4'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RG_NAME: rg-slurm-lab
+
+jobs:
+  check-and-destroy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Check age and destroy if stale
+        run: |
+          TTL_HOURS="${{ inputs.ttl_hours || '4' }}"
+
+          if [ "$(az group exists --name "$RG_NAME")" != "true" ]; then
+            echo "$RG_NAME does not exist — nothing to check."
+            exit 0
+          fi
+
+          DEPLOYED_AT=$(az group show --name "$RG_NAME" --query "tags.deployedAt" -o tsv)
+          if [ -z "$DEPLOYED_AT" ]; then
+            echo "No deployedAt tag found — leaving it alone (can't determine age safely)."
+            exit 0
+          fi
+
+          NOW_EPOCH=$(date -u +%s)
+          DEPLOYED_EPOCH=$(date -u -d "$DEPLOYED_AT" +%s)
+          AGE_HOURS=$(( (NOW_EPOCH - DEPLOYED_EPOCH) / 3600 ))
+
+          echo "$RG_NAME deployed at $DEPLOYED_AT, age ${AGE_HOURS}h, TTL ${TTL_HOURS}h"
+
+          if [ "$AGE_HOURS" -ge "$TTL_HOURS" ]; then
+            echo "Stale — destroying."
+            az group delete --name "$RG_NAME" --yes
+            echo "Deleted $RG_NAME."
+          else
+            echo "Not stale yet."
+          fi
