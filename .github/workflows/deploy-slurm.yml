@@ -8,9 +8,12 @@ on:
         required: false
         default: 'eastus'
       vmSize:
-        description: 'VM size for both nodes'
+        description: 'VM size for all three nodes'
         required: false
         default: 'Standard_B2s'
+      allowedIp:
+        description: 'Your current public IP in CIDR form (e.g. 203.0.113.5/32) — check https://ifconfig.me. Only this IP can reach Grafana.'
+        required: true
 
 permissions:
   id-token: write
@@ -57,6 +60,7 @@ jobs:
                          mungeKeyBase64="$MUNGE_KEY" \
                          adminUsername="azureuser" \
                          adminPassword="$ADMIN_PW" \
+                         allowedIp="${{ inputs.allowedIp }}" \
             --output none
 
   smoke-test:
@@ -100,21 +104,52 @@ jobs:
             --scripts "srun --nodes=2 hostname" \
             --query "value[0].message" -o tsv
 
-      - name: Print how to submit a PyTorch job
+      - name: Confirm Prometheus sees all three node_exporter targets as up
         run: |
-          cat <<'EOF'
+          echo "Polling Prometheus on vm-monitor until all targets are up..."
+          for i in $(seq 1 20); do
+            OUT=$(az vm run-command invoke \
+              --resource-group "$RG_NAME" \
+              --name vm-monitor \
+              --command-id RunShellScript \
+              --scripts "curl -s http://localhost:9090/api/v1/targets | grep -o '\"health\":\"[a-z]*\"' | sort | uniq -c" \
+              --query "value[0].message" -o tsv 2>/dev/null || true)
+            echo "--- attempt $i ---"
+            echo "$OUT"
+            if echo "$OUT" | grep -q "4 \"health\":\"up\"" && ! echo "$OUT" | grep -q "down"; then
+              echo "All 4 Prometheus targets (prometheus + 3 node_exporters) are up."
+              break
+            fi
+            if [ "$i" -eq 20 ]; then
+              echo "Prometheus targets did not all come up in time." >&2
+              exit 1
+            fi
+            sleep 15
+          done
+
+      - name: Print Grafana URL and how to submit a PyTorch job
+        run: |
+          MONITOR_IP=$(az network public-ip show --resource-group "$RG_NAME" --name pip-monitor --query ipAddress -o tsv)
+          cat <<EOF
 
           Cluster is up and left running (it will NOT auto-destroy).
           When you're done, run the "Destroy Slurm Lab" workflow, or it will
           be auto-destroyed by the hourly safety-net workflow after its TTL.
 
+          Grafana:  http://${MONITOR_IP}:3000
+            Login with admin / admin and CHANGE THE PASSWORD IMMEDIATELY —
+            it's reachable from the public internet, restricted only to the
+            IP you passed as allowedIp. The Prometheus datasource is already
+            provisioned; add a dashboard (e.g. "Node Exporter Full", id 1860)
+            to see CPU/mem/disk/network for all three nodes.
+
           Example: run a PyTorch job on the compute node from your machine
           (requires az login with rights to this resource group):
 
-            az vm run-command invoke \
-              --resource-group rg-slurm-lab \
-              --name vm-controller \
-              --command-id RunShellScript \
+            az vm run-command invoke \\
+              --resource-group rg-slurm-lab \\
+              --name vm-controller \\
+              --command-id RunShellScript \\
               --scripts "srun --nodes=1 --nodelist=compute python3 -c 'import torch; print(torch.rand(3,3))'"
 
           EOF

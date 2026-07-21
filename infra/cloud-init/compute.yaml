@@ -9,6 +9,7 @@ packages:
   - slurmd
   - python3
   - python3-pip
+  - prometheus-node-exporter
 
 write_files:
   # No owner/permissions here: the munge user doesn't exist until the
@@ -70,3 +71,5 @@ runcmd:
   - pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
   - systemctl enable slurmd
   - systemctl restart slurmd
+  - systemctl enable prometheus-node-exporter
+  - systemctl restart prometheus-node-exporter

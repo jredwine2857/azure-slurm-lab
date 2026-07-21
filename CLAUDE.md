@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A learning project: GitHub Actions CI/CD + Bicep IaC that deploys a minimal 2-node Slurm cluster to Azure (one controller, one compute, both CPU-only `Standard_B2s`), so PyTorch jobs can be submitted to a real scheduler without paying for it to sit idle. No SSH, no public IPs — everything is driven through `az vm run-command invoke` over the Azure control plane.
+A learning project: GitHub Actions CI/CD + Bicep IaC that deploys a minimal 2-node Slurm cluster plus a Prometheus/Grafana monitoring node to Azure (controller, compute, monitor — all `Standard_B2s`), so PyTorch jobs can be submitted to a real scheduler without paying for it to sit idle. No SSH; the two Slurm nodes have no public IPs at all — everything there is driven through `az vm run-command invoke` over the Azure control plane. `vm-monitor` is the sole exception, with a public IP locked to one caller IP for Grafana.
 
 ## Commands
 
@@ -14,7 +14,9 @@ az bicep build --file infra/main.bicep
 az deployment group what-if \
   --resource-group rg-slurm-lab \
   --template-file infra/main.bicep \
-  --parameters mungeKeyBase64=$(head -c 32 /dev/urandom | base64 -w0) adminPassword=$(openssl rand -base64 24)
+  --parameters mungeKeyBase64=$(head -c 32 /dev/urandom | base64 -w0) \
+               adminPassword=$(openssl rand -base64 24) \
+               allowedIp="$(curl -s https://ifconfig.me)/32"
 ```
 
 Driving the pipeline (requires `gh auth login` with a token that has the `workflow` scope):
@@ -41,6 +43,8 @@ az vm run-command invoke --resource-group rg-slurm-lab --name vm-controller \
 ```
 Output from `run-command` is capped at 4096 bytes — keep diagnostic scripts narrow (pipe through `grep`/`tail`) or you'll silently lose the part you need.
 
+Grafana (the one thing with a real public IP): `http://<monitorPublicIp>:3000`, default `admin`/`admin`. Get the IP with `az network public-ip show --resource-group rg-slurm-lab --name pip-monitor --query ipAddress -o tsv` (it's also printed at the end of `deploy-slurm.yml`'s smoke-test job). Only reachable from the `allowedIp` passed at deploy time — redeploy with a new value if your IP changes.
+
 One-time environment bootstrap: `scripts/bootstrap-oidc.sh` (edit the `GITHUB_ORG`/`GITHUB_REPO` vars at the top first). It's idempotent — safe to re-run.
 
 ## Architecture
@@ -50,13 +54,19 @@ One-time environment bootstrap: `scripts/bootstrap-oidc.sh` (edit the `GITHUB_OR
 - `destroy.yml` — manual, no gate, blocking `az group delete` (no `--no-wait`, so success in the log means Azure has confirmed full deletion, not just queued it).
 - `auto-destroy-stale.yml` — hourly cron backstop that reads a `deployedAt` tag on `rg-slurm-lab` (set by the deploy job) and destroys if older than the TTL. This exists because destroy is otherwise manual and cost risk is "forgot to run it," not "rate is too high."
 
-**Static IPs, not service discovery.** Controller is always `10.0.0.4`, compute is always `10.0.0.5`, assigned in Bicep (`privateIPAllocationMethod: 'Static'`). `slurm.conf` is baked into both cloud-init files with these literal addresses — there's no runtime discovery logic to reason about.
+**Static IPs, not service discovery.** Controller is always `10.0.0.4`, compute always `10.0.0.5`, monitor always `10.0.0.6`, assigned in Bicep (`privateIPAllocationMethod: 'Static'`). `slurm.conf` and `prometheus.yml`'s scrape targets are baked into the cloud-init files with these literal addresses — there's no runtime discovery logic to reason about.
 
-**Controller runs both `slurmctld` and `slurmd`.** It's not a pure control node; it's also schedulable, so a 2-node partition (`debug`, in `infra/cloud-init/*.yaml`) actually has two working `slurmd`s. If you add a third pure-controller node, you'd need to remove it from `PartitionName=... Nodes=...`.
+**Controller runs both `slurmctld` and `slurmd`.** It's not a pure control node; it's also schedulable, so a 2-node partition (`debug`, in `infra/cloud-init/controller.yaml`/`compute.yaml`) actually has two working `slurmd`s. If you add a third pure-controller node, you'd need to remove it from `PartitionName=... Nodes=...`.
 
-**Only the munge key is templated at deploy time** (`__MUNGE_KEY__` in the cloud-init YAML, substituted via Bicep's `replace(loadTextContent(...), ...)`). Everything else in `slurm.conf`/cloud-init is static committed text — IPs and hostnames are design-time constants, not something Bicep computes.
+**`vm-monitor` is the only VM with a public IP.** NSG has exactly one explicit inbound rule (`AllowGrafanaFromMyIp`, in `infra/main.bicep`) — TCP 3000 from the `allowedIp` param to `10.0.0.6` only. Everything else (Slurm ports, `node_exporter`'s 9100, munge) relies purely on the NSG's implicit default rules (deny internet inbound, allow VNet-internal), same as before this was added.
 
-**Cloud-init `write_files` ordering is load-bearing.** `write_files` runs *before* the `packages` install step in cloud-init's module order. The `munge.key` entry must NOT set `owner: munge:munge` in `write_files` — the `munge` user doesn't exist yet at that point in boot, the `chown` lookup throws, and **that failure aborts the entire `write_files` module**, silently dropping every other file in it (`slurm.conf`, the `/etc/hosts` entries) with no obvious error at the cloud-init level. Ownership/permissions on the key are fixed up in `runcmd` instead, which runs after packages install. If you add more `write_files` entries, keep this ordering constraint in mind.
+**Only the munge key is templated at deploy time** (`__MUNGE_KEY__` in the cloud-init YAML, substituted via Bicep's `replace(loadTextContent(...), ...)`). Everything else in `slurm.conf`/`prometheus.yml`/cloud-init is static committed text — IPs and hostnames are design-time constants, not something Bicep computes. `monitor.yaml` has no secrets to inject at all (Grafana stays at its default `admin`/`admin` — see below), so it's loaded with plain `loadTextContent()`, no `replace()`.
+
+**Cloud-init `write_files` ordering is load-bearing.** `write_files` runs *before* the `packages` install step in cloud-init's module order. Any `write_files` entry that sets `owner:`/`permissions:` to a user a not-yet-installed package creates (e.g. `munge`, or `grafana` for `/etc/grafana/...`) will throw on the `chown` lookup, and **that failure aborts the entire `write_files` module**, silently dropping every other file in it with no obvious error at the cloud-init level. `monitor.yaml`'s Grafana datasource provisioning file is written as `root:root` for exactly this reason, same as `munge.key`/`slurm.conf` in the other two files. Ownership fixups (if ever needed) belong in `runcmd`, which runs after packages install.
+
+**Grafana's apt repo isn't in Ubuntu's default sources.** `monitor.yaml` fetches the signing key and adds `apt.grafana.com` in `runcmd` (via `curl`/`gpg --dearmor`), not cloud-init's `apt.sources` directive — deliberately, so a bad fetch is debuggable via `az vm run-command` after the fact instead of failing silently earlier in boot, before there's a way to inspect it.
+
+**Grafana ships at the default `admin`/`admin` login, on purpose.** Generating a random Grafana password in CI and masking it in logs (the pattern used for the munge key and VM admin password) would make it unrecoverable — there'd be no way to actually read it back out to log in. Grafana's own first-login flow is the right place to set a real password; the deploy workflow's final step and the README both call this out explicitly. Don't "fix" this by threading a generated secret through without also solving how the user gets it back.
 
 **`customData` only applies at first boot.** Changing cloud-init content and re-running `az deployment group create` against existing VMs does *not* re-trigger cloud-init — Bicep will happily "update" the VM resource but the new customData is inert. To pick up a cloud-init change you must destroy and recreate (`destroy.yml` then `deploy-slurm.yml`), not just redeploy.
 
