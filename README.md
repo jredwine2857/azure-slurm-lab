@@ -83,7 +83,7 @@ az bicep build --file infra/main.bicep
 az deployment group what-if \
   --resource-group rg-slurm-lab \
   --template-file infra/main.bicep \
-  --parameters mungeKeyBase64=$(head -c 32 /dev/urandom | base64 -w0) adminPassword='Temp123!Temp123!'
+  --parameters mungeKeyBase64=$(head -c 32 /dev/urandom | base64 -w0) adminPassword=$(openssl rand -base64 24)
 ```
 
 ## Manual cleanup fallback
