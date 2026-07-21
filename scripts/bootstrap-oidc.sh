@@ -59,7 +59,7 @@ create_federated_credential() {
   cat > "$tmpfile" <<EOF
 {
   "name": "${cred_name}",
-  "issuer": "https://token.actions.githubusercontent.com/",
+  "issuer": "https://token.actions.githubusercontent.com",
   "subject": "${subject}",
   "description": "${description}",
   "audiences": ["api://AzureADTokenExchange"]
