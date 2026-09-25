@@ -29,10 +29,9 @@ IP instead.
 
 Prometheus scrapes `node_exporter` (host-level CPU/mem/disk/network metrics)
 on all three nodes — this is host metrics only, not Slurm job/queue metrics.
-There's no `apt`-packaged Slurm Prometheus exporter; adding one would mean
-pulling a third-party binary release into cloud-init, which is more fragility
-than this pass is taking on. A Slurm-specific exporter is a reasonable
-follow-up once this is proven reliable.
+There's no `apt`-packaged Slurm Prometheus exporter, and pulling a third-party
+binary into cloud-init adds a failure point to every deploy, so I left it out to
+keep provisioning reliable. A Slurm job/queue exporter is the next step.
 
 Grafana comes up with the Prometheus datasource already provisioned (no
 manual wiring) but ships at the default `admin`/`admin` login — **change the
